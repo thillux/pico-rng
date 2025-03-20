@@ -9,9 +9,19 @@
 
 // Pico
 #include "pico/stdlib.h"
+#include "pico/unique_id.h"
 #include "hardware/gpio.h"
-#include "hardware/adc.h"
 #include "hardware/structs/rosc.h"
+#include "hardware/sync.h"
+
+#include "mbedtls/sha256.h"
+#include "mbedtls/chachapoly.h"
+#include "mbedtls/platform.h"
+
+#if !HAS_RP2350_TRNG
+#error PICO_RAND_SEED_ENTROPY_SRC_TRNG and PICO_RAND_ENTROPY_SRC_TRNG are only valid on RP2350
+#endif
+#include "hardware/structs/trng.h"
 
 // For memcpy
 #include <string.h>
@@ -76,8 +86,8 @@ static struct usb_device_configuration dev_config = {
         .device_descriptor = &device_descriptor,
         .interface_descriptor = &interface_descriptor,
         .config_descriptor = &config_descriptor,
-        .lang_descriptor = lang_descriptor,
-        .descriptor_strings = descriptor_strings,
+        .lang_descriptor = (const unsigned char*) lang_descriptor,
+        .descriptor_strings = (const unsigned char**) descriptor_strings,
         .endpoints = {
                 {
                         .descriptor = &ep0_out,
@@ -350,9 +360,22 @@ void usb_handle_string_descriptor(volatile struct usb_setup_packet *pkt) {
     if (i == 0) {
         len = 4;
         memcpy(&ep0_buf[0], dev_config.lang_descriptor, len);
-    } else {
+    } else if(i == 1) {
         // Prepare fills in ep0_buf
         len = usb_prepare_string_descriptor(dev_config.descriptor_strings[i - 1]);
+    } else if (i == 2) {
+        len = usb_prepare_string_descriptor(dev_config.descriptor_strings[i - 1]);
+    } else if (i == 3) {
+        pico_unique_board_id_t board_id;
+        pico_get_unique_board_id(&board_id);
+
+        char serial[2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1];
+        pico_get_unique_board_id_string(serial, 2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1);
+        len = usb_prepare_string_descriptor((const unsigned char *) serial);
+    } else {
+        // nothing to report
+        const char* empty = "";
+        len = usb_prepare_string_descriptor((const unsigned char*) empty);
     }
 
     usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), &ep0_buf[0], len);
@@ -601,6 +624,77 @@ void ep0_out_handler(uint8_t *buf, uint16_t len) {
     return;
 }
 
+static uint64_t __uninitialized_ram(rng_state);
+static uint32_t trng_sample_words[count_of(trng_hw->ehr_data)];
+static_assert(count_of(trng_hw->ehr_data) >= 2 && count_of(trng_hw->ehr_data) < 255, "");
+static unsigned char key[32];
+static union {
+    uint64_t ctr;
+    unsigned char nonce[12];
+} nonce;
+
+uint64_t capture_additional_trng_samples(void) {
+    unsigned char ret[32];
+
+    mbedtls_chachapoly_context *ctx = mbedtls_calloc(1, sizeof(mbedtls_chachapoly_context));
+    mbedtls_chachapoly_init(ctx);
+    mbedtls_chachapoly_setkey(ctx, key);
+    nonce.ctr += 1;
+    mbedtls_chachapoly_starts(ctx, nonce.nonce, MBEDTLS_CHACHAPOLY_ENCRYPT);
+
+    spin_lock_t *lock = spin_lock_instance(PICO_SPINLOCK_ID_RAND);
+    uint32_t save = spin_lock_blocking(lock);
+    bool valid = false;
+
+    // Sample one ROSC bit into EHR every cycle, subject to CPU keeping up.
+    // More temporal resolution to measure ROSC phase noise is better, if we
+    // use a high quality hash function instead of naive VN decorrelation.
+    // (Also more metastability events, which are a secondary noise source)
+    //
+    // This is out of the loop because writing to this register seems to
+    // restart the sampling, slowing things down. We don't care if this write
+    // is skipped as that would just make sampling take longer.
+    trng_hw->sample_cnt1 = 255;
+
+    // TRNG setup is inside loop in case it is skipped. Disable checks and
+    // bypass decorrelators, to stream raw TRNG ROSC samples:
+    trng_hw->trng_debug_control = 0; // -1u;
+    // Start ROSC if it is not already started
+    trng_hw->rnd_source_enable = -1u;
+    // Clear all interrupts (including EHR_VLD) -- we will check this
+    // later, after seeding RCP.
+    trng_hw->rng_icr = -1u;
+
+    // Wait for 192 ROSC samples to fill EHR, this should take constant time:
+    while (trng_hw->trng_busy);
+    valid = trng_hw->trng_valid;
+
+    for (uint i = 0; i < count_of(trng_sample_words); i++) {
+        trng_sample_words[i] = trng_hw->ehr_data[i];
+    }
+
+    // TRNG is now sampling again, having started after we read the last
+    // EHR word. Grab some random bits and use them to modulate
+    // the chain length, to reduce chance of injection locking:
+    trng_hw->trng_config = rng_state;
+
+    uint64_t rc = trng_sample_words[0] | (((uint64_t)trng_sample_words[1]) << 32);
+    trng_hw->rnd_source_enable = 0u;
+    spin_unlock(lock, save);
+    
+    mbedtls_chachapoly_update(ctx, 8, &rc, ret);
+    mbedtls_chachapoly_finish(ctx, ret);
+    mbedtls_chachapoly_free(ctx);
+    mbedtls_free(ctx);
+
+    if (valid) {
+        memcpy(key, &rc, sizeof(rc));
+        memcpy(&rc, ret, sizeof(rc));
+        return rc;
+    } else
+        return 0u;
+}
+
 /**
  * @brief Get random data using the onboard pico ADC that essentially measure
  *        environmental noise because it is assumed that it is not connected to anything.
@@ -608,32 +702,13 @@ void ep0_out_handler(uint8_t *buf, uint16_t len) {
  * @param buf the buffer to store the random data in
  * @param len the length of the random data in bytes
  */
-void get_random_data(char *buf, uint16_t len) {
+void get_random_data(uint8_t *buf, uint16_t len) {
     led_set_blink(BLINK_PROCESSING);
     if (len > 64)
         len = 64;
     memset(buf, 0, len);
-    /* This algorithm generates 2 words, i.e., 8 bytes. */
-    /* We apply Fowler–Noll–Vo hash function as it randomizes the input and is quite fast. */
     for (int i = 0; i < len; i += sizeof(uint64_t)) {
-        uint64_t random_word = 0xcbf29ce484222325;
-        for (int round = 0; round < 8; round++)
-        {
-            uint64_t word = 0x0;
-            for (int n = 0; n < 64; n++)
-            {
-                uint8_t bit1, bit2;
-                do
-                {
-                    bit1 = rosc_hw->randombit & 0xff;
-                    // sleep_ms(1);
-                    bit2 = rosc_hw->randombit & 0xff;
-                } while (0);
-                word = (word << 1) | bit1;
-            }
-            random_word ^= word^board_millis()^adc_read();
-            random_word *= 0x00000100000001B3;
-        }
+        uint64_t random_word = capture_additional_trng_samples();
         memcpy(buf + i, &random_word, sizeof(random_word));
     }
     led_set_blink(BLINK_MOUNTED);
@@ -677,11 +752,6 @@ int main(void) {
 #endif
 
     led_off_all();
-
-    // ADC
-    adc_init();
-    adc_gpio_init(27);
-    adc_select_input(1);
 
     printf("USB pico rng\n");
     usb_device_init();

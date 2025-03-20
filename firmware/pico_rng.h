@@ -73,7 +73,7 @@ static const struct usb_device_descriptor device_descriptor = {
         .bcdDevice       = 0x0100, // No device revision number
         .iManufacturer   = 1,      // Manufacturer string index
         .iProduct        = 2,      // Product string index
-        .iSerialNumber = 0,        // No serial number
+        .iSerialNumber   = 3,      // Serial Number index
         .bNumConfigurations = 1    // One configuration
 };
 
@@ -111,13 +111,13 @@ static const struct usb_configuration_descriptor config_descriptor = {
         .bMaxPower = 0x32         // 100ma
 };
 
-static const unsigned char lang_descriptor[] = {
+static const char lang_descriptor[] = {
         4,         // bLength
         0x03,      // bDescriptorType == String Descriptor
         0x09, 0x04 // language id = us english
 };
 
-static const unsigned char *descriptor_strings[] = {
+static const char *descriptor_strings[] = {
         "Raspberry Pi",    // Vendor
         "Pico Random Number Generator" // Product
 };
