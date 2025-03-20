@@ -14,7 +14,6 @@
 #include "hardware/structs/rosc.h"
 #include "hardware/sync.h"
 
-#include "mbedtls/sha256.h"
 #include "mbedtls/chachapoly.h"
 #include "mbedtls/platform.h"
 
